@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -72,10 +73,24 @@ type ContractInfo struct {
 }
 
 type ContractStorageInfo struct {
-	Address     string `json:"address"`
-	CodeSize    int    `json:"codeSize"`
-	NumKeys     int    `json:"numKeys"`
-	StorageSize int    `json:"storageSize"`
+	Address  string `json:"address"`
+	CodeSize int    `json:"codeSize"`
+	NumSlots int    `json:"numSlots"`
+}
+
+type StorageRangeResult struct {
+	Storage map[string]StorageEntry `json:"storage"`
+	NextKey *string                 `json:"nextKey"`
+}
+
+type StorageEntry struct {
+	Key   *string `json:"key"`
+	Value string  `json:"value"`
+}
+
+type BlockByNumberResult struct {
+	Hash         string            `json:"hash"`
+	Transactions []json.RawMessage `json:"transactions"`
 }
 
 type Checkpoint struct {
@@ -280,9 +295,19 @@ func decodeCursor(cursor string) ([]int, error) {
 }
 
 func main() {
-	shouldReturn := fetchAccounts()
-	if shouldReturn {
-		return
+	mode := flag.String("mode", "accounts", "operation to run: accounts or storage")
+	flag.Parse()
+
+	switch *mode {
+	case "accounts":
+		if fetchAccounts() {
+			return
+		}
+	case "storage":
+		fetchContractStorage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown mode %q; use -mode=accounts or -mode=storage\\n", *mode)
+		os.Exit(2)
 	}
 }
 
@@ -564,4 +589,243 @@ func fetchAccounts() bool {
 
 	printSummary(&counters, startTime)
 	return false
+}
+
+// getBlockForStorage returns the block hash and transaction count needed by
+// debug_storageRangeAt. Using the last transaction index makes the state
+// correspond to the end-of-block state.
+func getBlockForStorage() (string, int, error) {
+	var result BlockByNumberResult
+
+	// eth_getBlockByNumber accepts the same hex quantity notation used by
+	// the other Ethereum JSON-RPC methods.
+	blockTag := fmt.Sprintf("0x%x", block)
+	if err := rpcCall("eth_getBlockByNumber", []any{blockTag, false}, &result); err != nil {
+		return "", 0, err
+	}
+	if result.Hash == "" {
+		return "", 0, fmt.Errorf("block %d was not found", block)
+	}
+
+	// debug_storageRangeAt's txIdx is the transaction whose post-state is
+	// inspected. For the end-of-block state, use the last transaction.
+	txIndex := len(result.Transactions) - 1
+	if txIndex < 0 {
+		// Empty blocks have no transaction state to inspect through
+		// debug_storageRangeAt. In that case, use index 0; Geth returns the
+		// parent state for an empty block.
+		txIndex = 0
+	}
+	return result.Hash, txIndex, nil
+}
+
+func getStoragePage(
+	blockHash string,
+	txIndex int,
+	address string,
+	keyStart string,
+	maxResult int,
+) (*StorageRangeResult, error) {
+	var result StorageRangeResult
+
+	if keyStart == "" {
+		keyStart = "0x"
+	}
+
+	params := []any{
+		blockHash,
+		txIndex,
+		address,
+		keyStart,
+		maxResult,
+	}
+
+	if err := rpcCall("debug_storageRangeAt", params, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func scanContractStorage(
+	blockHash string,
+	txIndex int,
+	contract ContractInfo,
+) (ContractStorageInfo, error) {
+	const storagePageSize = 1024
+
+	keyStart := "0x"
+	numSlots := 0
+
+	for {
+		page, err := getStoragePage(
+			blockHash,
+			txIndex,
+			contract.Address,
+			keyStart,
+			storagePageSize,
+		)
+		if err != nil {
+			return ContractStorageInfo{}, err
+		}
+
+		numSlots += len(page.Storage)
+
+		if page.NextKey == nil || *page.NextKey == "" {
+			break
+		}
+
+		nextKey := *page.NextKey
+		if nextKey == keyStart {
+			return ContractStorageInfo{}, fmt.Errorf(
+				"storage pagination did not advance for contract %s at key %s",
+				contract.Address,
+				keyStart,
+			)
+		}
+		keyStart = nextKey
+	}
+
+	return ContractStorageInfo{
+		Address:  contract.Address,
+		CodeSize: contract.CodeSize,
+		NumSlots: numSlots,
+	}, nil
+}
+
+func fetchContractStorage() {
+	blockHash, txIndex, err := getBlockForStorage()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to resolve block %d: %v\n", block, err)
+		os.Exit(1)
+	}
+
+	in, err := os.Open(contractsFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to open %s: %v\n", contractsFile, err)
+		os.Exit(1)
+	}
+	defer in.Close()
+
+	// This is a fresh derived file, so truncate it instead of appending
+	// duplicate records on subsequent runs.
+	out, err := os.OpenFile(
+		contractsStorageFile,
+		os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
+		0644,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to open %s: %v\n", contractsStorageFile, err)
+		os.Exit(1)
+	}
+	defer out.Close()
+
+	writer := bufio.NewWriterSize(out, 1024*1024)
+
+	scanner := bufio.NewScanner(in)
+	// Allow substantially larger JSONL records than the default Scanner limit.
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+
+	processed := 0
+	totalSlots := 0
+	lastSummary := time.Now()
+	startTime := time.Now()
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+
+		var contract ContractInfo
+		if err := json.Unmarshal(line, &contract); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to decode contracts.jsonl line %d: %v\n", processed+1, err)
+			os.Exit(1)
+		}
+		if contract.Address == "" {
+			fmt.Fprintf(os.Stderr, "contracts.jsonl line %d has no address\n", processed+1)
+			os.Exit(1)
+		}
+
+		info, err := scanContractStorage(blockHash, txIndex, contract)
+		if err != nil {
+			fmt.Fprintf(
+				os.Stderr,
+				"failed to scan storage for contract %s: %v\n",
+				contract.Address,
+				err,
+			)
+			os.Exit(1)
+		}
+
+		record, err := json.Marshal(info)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to encode storage for %s: %v\n", contract.Address, err)
+			os.Exit(1)
+		}
+		record = append(record, '\n')
+
+		if _, err := writer.Write(record); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write %s: %v\n", contractsStorageFile, err)
+			os.Exit(1)
+		}
+
+		processed++
+		totalSlots += info.NumSlots
+
+		if processed%flushEvery == 0 {
+			if err := writer.Flush(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to flush %s: %v\n", contractsStorageFile, err)
+				os.Exit(1)
+			}
+			if err := out.Sync(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to sync %s: %v\n", contractsStorageFile, err)
+				os.Exit(1)
+			}
+		}
+
+		elapsed := time.Since(startTime)
+
+		if time.Since(lastSummary) >= summaryInterval {
+			fmt.Printf(
+				"[%s] storage contracts=%d slots=%d logicalStorage=%d bytes (%.2f MiB) rate=%d/s elapsed=%v\n",
+				time.Now().Format("2006-01-02 15:04:05"),
+				processed,
+				totalSlots,
+				totalSlots*32,
+				float64(totalSlots*32)/(1024*1024),
+				int(float64(processed)/elapsed.Seconds()),
+				elapsed.Round(time.Second),
+			)
+			lastSummary = time.Now()
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed reading %s: %v\n", contractsFile, err)
+		os.Exit(1)
+	}
+
+	if err := writer.Flush(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to flush %s: %v\n", contractsStorageFile, err)
+		os.Exit(1)
+	}
+	if err := out.Sync(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to sync %s: %v\n", contractsStorageFile, err)
+		os.Exit(1)
+	}
+
+	fmt.Printf(
+		"[%s] Storage scan complete: contracts=%d slots=%d logicalStorage=%d bytes (%.2f MiB) block=%d blockHash=%s txIndex=%d output=%s elapsed=%v\n",
+		time.Now().Format("2006-01-02 15:04:05"),
+		processed,
+		totalSlots,
+		totalSlots*32,
+		float64(totalSlots*32)/(1024*1024),
+		block,
+		blockHash,
+		txIndex,
+		contractsStorageFile,
+		time.Since(startTime).Round(time.Second),
+	)
 }
