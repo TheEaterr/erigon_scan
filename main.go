@@ -16,16 +16,17 @@ import (
 const (
 	rpcURL   = "http://localhost:8546"
 	block    = uint64(25690000)
-	pageSize = 5
+	pageSize = 50
 
-	contractsFile  = "contracts.jsonl"
-	checkpointFile = "account_scan.checkpoint.json"
+	contractsFile        = "contracts.jsonl"
+	contractsStorageFile = "contracts_storage.jsonl"
+	checkpointFile       = "account_scan.checkpoint.json"
 
 	// How often to print the summary and save the checkpoint.
 	summaryInterval = 30 * time.Second
 
 	// Flush the JSONL writer after this many contracts.
-	flushEvery = 10
+	flushEvery = 100
 
 	emptyCodeHash = "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
 )
@@ -68,6 +69,13 @@ type Account struct {
 type ContractInfo struct {
 	Address  string `json:"address"`
 	CodeSize int    `json:"codeSize"`
+}
+
+type ContractStorageInfo struct {
+	Address     string `json:"address"`
+	CodeSize    int    `json:"codeSize"`
+	NumKeys     int    `json:"numKeys"`
+	StorageSize int    `json:"storageSize"`
 }
 
 type Checkpoint struct {
@@ -272,6 +280,13 @@ func decodeCursor(cursor string) ([]int, error) {
 }
 
 func main() {
+	shouldReturn := fetchAccounts()
+	if shouldReturn {
+		return
+	}
+}
+
+func fetchAccounts() bool {
 	checkpoint, err := loadCheckpoint()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load checkpoint: %v\n", err)
@@ -285,7 +300,7 @@ func main() {
 			checkpoint.RegularAccounts,
 			checkpoint.ContractAccounts,
 		)
-		return
+		return true
 	}
 
 	// Append-only output.
@@ -548,4 +563,5 @@ func main() {
 	}
 
 	printSummary(&counters, startTime)
+	return false
 }
