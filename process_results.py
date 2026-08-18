@@ -22,7 +22,7 @@ def process_contracts_storage():
                 print(f"Current progress {current_line} / 86004957")
                 
     storage_sizes.dump("storage_sizes.pickle")
-    with open("big_contracts.json", mode="x") as f:
+    with open("big_contracts.json", mode="w") as f:
         json.dump(big_contracts, f)
                 
     
