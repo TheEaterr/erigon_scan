@@ -42,14 +42,13 @@ def graph_big_contracts():
         sizes, labels = zip(*sorted(zip(sizes, labels), reverse=True))
         new_labels = [""] * len(labels)
         new_labels[0] = labels[0]
-        new_labels[1] = labels[1]
         plt.pie(sizes, labels=new_labels)
-        plt.title("Composition of Ethereum Contract storage")
+        plt.title(f"Composition of Ethereum Contract storage\n(Showing contracts with >= 100k slots, {len(big_contracts)} contracts)")
         plt.tight_layout()
         plt.savefig("big_contracts_pie.svg")
 
     
 if __name__ == "__main__":
-    # graph_contracts_storage(True)
-    # graph_contracts_storage(False)
+    graph_contracts_storage(True)
+    graph_contracts_storage(False)
     graph_big_contracts()
