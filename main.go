@@ -20,6 +20,7 @@ const (
 	pageSize = 50
 
 	contractsFile        = "contracts.jsonl"
+	accountsFile         = "accounts.jsonl"
 	contractsStorageFile = "contracts_storage.jsonl"
 	checkpointFile       = "account_scan.checkpoint.json"
 
@@ -70,6 +71,11 @@ type Account struct {
 type ContractInfo struct {
 	Address  string `json:"address"`
 	CodeSize int    `json:"codeSize"`
+}
+
+type AccountInfo struct {
+	Address string `json:"address"`
+	Balance string `json:"balance"`
 }
 
 type ContractStorageInfo struct {
@@ -328,19 +334,31 @@ func fetchAccounts() bool {
 		return true
 	}
 
-	// Append-only output.
-	file, err := os.OpenFile(
+	// Append-only outputs.
+	contractsOut, err := os.OpenFile(
 		contractsFile,
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
 		0644,
 	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to open output file: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to open %s: %v\n", contractsFile, err)
 		os.Exit(1)
 	}
-	defer file.Close()
+	defer contractsOut.Close()
 
-	writer := bufio.NewWriterSize(file, 1024*1024)
+	accountsOut, err := os.OpenFile(
+		accountsFile,
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
+		0644,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to open %s: %v\n", accountsFile, err)
+		os.Exit(1)
+	}
+	defer accountsOut.Close()
+
+	contractWriter := bufio.NewWriterSize(contractsOut, 1024*1024)
+	accountsWriter := bufio.NewWriterSize(accountsOut, 1024*1024)
 
 	var counters Counters
 
@@ -371,12 +389,15 @@ func fetchAccounts() bool {
 
 	lastSummary := time.Now()
 	contractsSinceFlush := 0
+	accountsSinceFlush := 0
 
 	for {
 		page, err := getAccountPage(start)
 		if err != nil {
-			_ = writer.Flush()
-			_ = file.Sync()
+			_ = contractWriter.Flush()
+			_ = contractsOut.Sync()
+			_ = accountsWriter.Flush()
+			_ = accountsOut.Sync()
 
 			cp := Checkpoint{
 				Block:            block,
@@ -404,6 +425,50 @@ func fetchAccounts() bool {
 		counters.accountsSeen.Add(uint64(len(page.Accounts)))
 
 		for address, account := range page.Accounts {
+			accountInfo := AccountInfo{
+				Address: address,
+				Balance: account.Balance,
+			}
+
+			accountLine, err := json.Marshal(accountInfo)
+			if err != nil {
+				fmt.Fprintf(
+					os.Stderr,
+					"failed to encode account %s: %v\n",
+					address,
+					err,
+				)
+				os.Exit(1)
+			}
+
+			accountLine = append(accountLine, '\n')
+
+			n, err := accountsWriter.Write(accountLine)
+			if err != nil {
+				fmt.Fprintf(
+					os.Stderr,
+					"failed to write account: %v\n",
+					err,
+				)
+				os.Exit(1)
+			}
+
+			counters.bytesWritten.Add(uint64(n))
+
+			accountsSinceFlush++
+
+			if accountsSinceFlush >= flushEvery {
+				if err := accountsWriter.Flush(); err != nil {
+					fmt.Fprintf(
+						os.Stderr,
+						"failed to flush output: %v\n",
+						err,
+					)
+					os.Exit(1)
+				}
+
+				accountsSinceFlush = 0
+			}
 
 			// No code means regular account.
 			if account.CodeHash == emptyCodeHash ||
@@ -441,7 +506,7 @@ func fetchAccounts() bool {
 
 			line = append(line, '\n')
 
-			n, err := writer.Write(line)
+			n, err = contractWriter.Write(line)
 			if err != nil {
 				fmt.Fprintf(
 					os.Stderr,
@@ -456,7 +521,7 @@ func fetchAccounts() bool {
 			contractsSinceFlush++
 
 			if contractsSinceFlush >= flushEvery {
-				if err := writer.Flush(); err != nil {
+				if err := contractWriter.Flush(); err != nil {
 					fmt.Fprintf(
 						os.Stderr,
 						"failed to flush output: %v\n",
@@ -476,7 +541,7 @@ func fetchAccounts() bool {
 		now := time.Now()
 
 		if now.Sub(lastSummary) >= summaryInterval {
-			if err := writer.Flush(); err != nil {
+			if err := contractWriter.Flush(); err != nil {
 				fmt.Fprintf(
 					os.Stderr,
 					"failed to flush output: %v\n",
@@ -485,7 +550,25 @@ func fetchAccounts() bool {
 				os.Exit(1)
 			}
 
-			if err := file.Sync(); err != nil {
+			if err := accountsWriter.Flush(); err != nil {
+				fmt.Fprintf(
+					os.Stderr,
+					"failed to flush output: %v\n",
+					err,
+				)
+				os.Exit(1)
+			}
+
+			if err := contractsOut.Sync(); err != nil {
+				fmt.Fprintf(
+					os.Stderr,
+					"failed to sync output: %v\n",
+					err,
+				)
+				os.Exit(1)
+			}
+
+			if err := accountsOut.Sync(); err != nil {
 				fmt.Fprintf(
 					os.Stderr,
 					"failed to sync output: %v\n",
@@ -548,22 +631,23 @@ func fetchAccounts() bool {
 		}
 	}
 
-	// Final flush.
-	if err := writer.Flush(); err != nil {
-		fmt.Fprintf(
-			os.Stderr,
-			"failed to flush output: %v\n",
-			err,
-		)
+	if err := contractWriter.Flush(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to flush %s: %v\n", contractsFile, err)
 		os.Exit(1)
 	}
 
-	if err := file.Sync(); err != nil {
-		fmt.Fprintf(
-			os.Stderr,
-			"failed to sync output: %v\n",
-			err,
-		)
+	if err := accountsWriter.Flush(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to flush %s: %v\n", accountsFile, err)
+		os.Exit(1)
+	}
+
+	if err := contractsOut.Sync(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to sync %s: %v\n", contractsFile, err)
+		os.Exit(1)
+	}
+
+	if err := accountsOut.Sync(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to sync %s: %v\n", accountsFile, err)
 		os.Exit(1)
 	}
 
