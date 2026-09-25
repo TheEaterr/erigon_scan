@@ -21,7 +21,7 @@ const (
 
 	contractsFile        = "contracts.jsonl"
 	accountsFile         = "accounts.jsonl"
-	contractsStorageFile = "contracts_storage.jsonl"
+	contractsStorageFile = "contracts_storage_full.jsonl"
 	checkpointFile       = "account_scan.checkpoint.json"
 
 	// How often to print the summary and save the checkpoint.
@@ -79,9 +79,10 @@ type AccountInfo struct {
 }
 
 type ContractStorageInfo struct {
-	Address  string `json:"address"`
-	CodeSize int    `json:"codeSize"`
-	NumSlots int    `json:"numSlots"`
+	Address  string   `json:"address"`
+	CodeSize int      `json:"codeSize"`
+	NumSlots int      `json:"numSlots"`
+	Slots    []string `json:"slots,omitempty"`
 }
 
 type StorageRangeResult struct {
@@ -302,6 +303,7 @@ func decodeCursor(cursor string) ([]int, error) {
 
 func main() {
 	mode := flag.String("mode", "accounts", "operation to run: accounts or storage")
+	startAddress := flag.String("start", "", "starting address for contract storage scan (base58)")
 	flag.Parse()
 
 	switch *mode {
@@ -310,7 +312,7 @@ func main() {
 			return
 		}
 	case "storage":
-		fetchContractStorage()
+		fetchContractStorage(startAddress)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q; use -mode=accounts or -mode=storage\\n", *mode)
 		os.Exit(2)
@@ -740,6 +742,7 @@ func scanContractStorage(
 
 	keyStart := "0x"
 	numSlots := 0
+	slots := make([]string, 0)
 
 	for {
 		page, err := getStoragePage(
@@ -754,6 +757,16 @@ func scanContractStorage(
 		}
 
 		numSlots += len(page.Storage)
+		for key := range page.Storage {
+			entry := page.Storage[key]
+			if entry.Key == nil {
+				return ContractStorageInfo{}, fmt.Errorf(
+					"storage entry for contract %s has nil key",
+					contract.Address,
+				)
+			}
+			slots = append(slots, *entry.Key)
+		}
 
 		if page.NextKey == nil || *page.NextKey == "" {
 			break
@@ -774,10 +787,11 @@ func scanContractStorage(
 		Address:  contract.Address,
 		CodeSize: contract.CodeSize,
 		NumSlots: numSlots,
+		Slots:    slots,
 	}, nil
 }
 
-func fetchContractStorage() {
+func fetchContractStorage(startAddress *string) {
 	blockHash, txIndex, err := getBlockForStorage()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to resolve block %d: %v\n", block, err)
@@ -806,6 +820,11 @@ func fetchContractStorage() {
 
 	writer := bufio.NewWriterSize(out, 1024*1024)
 
+	var startAddressStr string
+	if startAddress != nil {
+		startAddressStr = *startAddress
+	}
+
 	scanner := bufio.NewScanner(in)
 	// Allow substantially larger JSONL records than the default Scanner limit.
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
@@ -830,11 +849,13 @@ func fetchContractStorage() {
 			fmt.Fprintf(os.Stderr, "contracts.jsonl line %d has no address\n", processed+1)
 			os.Exit(1)
 		}
+		if startAddressStr != "" && contract.Address < startAddressStr {
+			continue
+		}
 
 		info, err := scanContractStorage(blockHash, txIndex, contract)
 		if err != nil {
-			fmt.Fprintf(
-				os.Stderr,
+			fmt.Printf(
 				"failed to scan storage for contract %s: %v\n",
 				contract.Address,
 				err,
